@@ -1,0 +1,31 @@
+# Database Configuration
+# 支持 SQLite 和 PostgreSQL
+# 示例:
+#   sqlite: sqlite:///./face_recognition.db
+#   postgresql://user:password@localhost:5432/dbname
+
+database:
+  type: sqlite
+  url: sqlite:///./face_recognition.db
+
+# Server Configuration
+server:
+  host: 0.0.0.0
+  port: 8000
+  workers: 4
+  reload: false
+
+# Face Recognition Model
+model:
+  name: buffalo_l
+  det_size: [640, 640]
+
+# Threshold Configuration (判定阈值)
+threshold:
+  cosine_similarity: 0.5      # 余弦相似度阈值，>此值判定为同一人
+  similarity_percent: 75     # 相似度百分比阈值，>此值判定为同一人
+
+# Upload Configuration
+upload:
+  max_file_size: 10485760  # 10MB
+  allowed_extensions: [jpg, jpeg, png, bmp]
