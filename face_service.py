@@ -3,7 +3,16 @@ import numpy as np
 from typing import List, Dict, Tuple
 from insightface.app import FaceAnalysis
 import onnxruntime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from config_loader import get_threshold_config
+
+_inference_executor = ThreadPoolExecutor(max_workers=4)
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
+
+_inference_executor = ThreadPoolExecutor(max_workers=4)
 
 
 def get_providers():
@@ -27,10 +36,24 @@ class FaceService:
         self.app = FaceAnalysis(name=model_name, providers=providers)
         self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
     
-    def detect_faces(self, image_path: str) -> List[Dict]:
-        img = cv2.imread(str(image_path))
+    def _read_image(self, image_input: str | bytes | np.ndarray) -> np.ndarray:
+        """Read image from file path, bytes, or numpy array."""
+        if isinstance(image_input, str):
+            img = cv2.imread(image_input)
+        elif isinstance(image_input, bytes):
+            nparr = np.frombuffer(image_input, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        elif isinstance(image_input, np.ndarray):
+            img = image_input
+        else:
+            raise ValueError(f"Unsupported image input type: {type(image_input)}")
+        
         if img is None:
-            raise ValueError("Failed to read image")
+            raise ValueError("Failed to decode image")
+        return img
+    
+    def detect_faces(self, image_input: str | bytes | np.ndarray) -> List[Dict]:
+        img = self._read_image(image_input)
         
         faces = self.app.get(img)
         results = []
@@ -44,10 +67,8 @@ class FaceService:
         
         return results
     
-    def detect_faces_with_confidence(self, image_path: str) -> List[Dict]:
-        img = cv2.imread(str(image_path))
-        if img is None:
-            raise ValueError("Failed to read image")
+    def detect_faces_with_confidence(self, image_input: str | bytes | np.ndarray) -> List[Dict]:
+        img = self._read_image(image_input)
         
         faces = self.app.get(img)
         results = []
@@ -67,10 +88,8 @@ class FaceService:
         
         return results
     
-    def extract_embedding(self, image_path: str) -> Tuple[np.ndarray, Dict]:
-        img = cv2.imread(str(image_path))
-        if img is None:
-            raise ValueError("Failed to read image")
+    def extract_embedding(self, image_input: str | bytes | np.ndarray) -> Tuple[np.ndarray, Dict]:
+        img = self._read_image(image_input)
         
         faces = self.app.get(img)
         if len(faces) == 0:
@@ -79,7 +98,7 @@ class FaceService:
             raise ValueError("Multiple faces detected in image")
         
         face = faces[0]
-        embedding = face.embedding
+        embedding = face.embedding.astype(np.float32)
         
         return embedding, {
             'bbox': face.bbox.tolist(),
@@ -118,12 +137,12 @@ class FaceService:
             for i in sorted_order
         ]
     
-    def compare_faces(self, img1_path: str, img2_path: str) -> Dict:
+    def compare_faces(self, img1_input: str | bytes | np.ndarray, img2_input: str | bytes | np.ndarray) -> Dict:
         threshold_config = get_threshold_config()
         default_threshold = threshold_config.get("cosine_similarity", 0.5)
         
-        emb1, _ = self.extract_embedding(img1_path)
-        emb2, _ = self.extract_embedding(img2_path)
+        emb1, _ = self.extract_embedding(img1_input)
+        emb2, _ = self.extract_embedding(img2_input)
         
         cosine_sim = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
         euclidean_dist = np.linalg.norm(emb1 - emb2)
@@ -135,6 +154,23 @@ class FaceService:
             'is_same': cosine_sim > default_threshold,
             'threshold': default_threshold
         }
+
+    # Async wrappers using thread pool executor
+    async def detect_faces_async(self, image_input: str | bytes | np.ndarray) -> List[Dict]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_inference_executor, self.detect_faces, image_input)
+
+    async def detect_faces_with_confidence_async(self, image_input: str | bytes | np.ndarray) -> List[Dict]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_inference_executor, self.detect_faces_with_confidence, image_input)
+
+    async def extract_embedding_async(self, image_input: str | bytes | np.ndarray) -> Tuple[np.ndarray, Dict]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_inference_executor, self.extract_embedding, image_input)
+
+    async def compare_faces_async(self, img1_input: str | bytes | np.ndarray, img2_input: str | bytes | np.ndarray) -> Dict:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_inference_executor, self.compare_faces, img1_input, img2_input)
 
 
 class _LazyFaceService:

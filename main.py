@@ -9,8 +9,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, text, delete
+from sqlalchemy import text as _sa_text
+from pydantic import BaseModel, Field
+import numpy as np
+
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import select, text, delete
+from sqlalchemy import text as _sa_text
 from pydantic import BaseModel, Field
 import numpy as np
 
@@ -29,7 +36,21 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    await init_db()
+    # Model warmup
+    import numpy as np
+    dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+    try:
+        await face_service.detect_faces_async(dummy)
+    except Exception:
+        pass
+    yield
+    dummy_image = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+    try:
+        face_service.detect_faces(dummy_image)
+        logger.info("Model warmup completed")
+    except Exception as e:
+        logger.warning(f"Model warmup failed: {e}")
     yield
 
 
@@ -151,7 +172,7 @@ def validate_upload(filename: str, file_size: int, content: bytes):
         raise HTTPException(status_code=400, detail="File is not a supported image format")
 
 
-def decode_base64_image(base64_str: str) -> Path:
+def decode_base64_image(base64_str: str) -> bytes:
     if ',' in base64_str:
         base64_str = base64_str.split(',')[1]
     
@@ -161,12 +182,15 @@ def decode_base64_image(base64_str: str) -> Path:
         base64_str += '=' * padding
     image_data = base64.b64decode(base64_str)
     validate_upload("image.jpg", len(image_data), image_data)
-    image = Image.open(io.BytesIO(image_data))
-    
+    return image_data
+
+
+def save_image_bytes(image_bytes: bytes) -> Path:
+    """Save image bytes to upload directory and return path."""
     filename = f"{uuid.uuid4()}.jpg"
     file_path = UPLOAD_DIR / filename
-    image.save(file_path)
-    
+    with open(file_path, "wb") as f:
+        f.write(image_bytes)
     return file_path
 
 
@@ -198,9 +222,8 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=10, ge=1, le=1000)
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
-
 @app.get("/")
-def root():
+async def root():
     return {"message": "ArcFace Face Recognition API", "version": "1.0.0"}
 
 
@@ -216,6 +239,7 @@ def health(db: Session = Depends(get_db)):
 class CreateLibraryRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     description: str | None = None
+
 
 @app.post("/api/libraries", response_model=FaceLibrarySchema)
 def create_library(request: CreateLibraryRequest, db: Session = Depends(get_db)):
@@ -236,8 +260,8 @@ def list_libraries(
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db)
 ):
-    query = db.query(FaceLibrary).order_by(FaceLibrary.id)
-    return query.offset((page - 1) * page_size).limit(page_size).all()
+    query = db.query(FaceLibrary).order_by(FaceLibrary.id).offset((page - 1) * page_size).limit(page_size)
+    return query.all()
 
 
 @app.get("/api/libraries/{library_id}", response_model=FaceLibrarySchema)
@@ -324,19 +348,18 @@ def add_library_member(
         f.write(file_bytes)
     
     try:
-        embedding, face_info = face_service.extract_embedding(str(file_path))
+        embedding, face_info = face_service.extract_embedding(file_bytes)
     except Exception as e:
         file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
     
-    embedding_str = json.dumps(embedding.tolist())
+    embedding_bytes = embedding.astype(np.float32).tobytes()
     
     member = FaceMember(
         record_id=str(uuid.uuid4()),
         library_id=library_id,
         name=name,
-        embedding=float(np.linalg.norm(embedding)),
-        embedding_vector=embedding_str,
+        embedding_vector=embedding_bytes,
         image_path=str(file_path)
     )
     db.add(member)
@@ -390,19 +413,18 @@ def add_library_member_by_path(
     validate_upload(dest.name, len(file_bytes), file_bytes)
     
     try:
-        embedding, face_info = face_service.extract_embedding(str(dest))
+        embedding, face_info = face_service.extract_embedding(file_bytes)
     except Exception:
         dest.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Face extraction failed")
     
-    embedding_str = json.dumps(embedding.tolist())
+    embedding_bytes = embedding.astype(np.float32).tobytes()
     
     member = FaceMember(
         record_id=str(uuid.uuid4()),
         library_id=library_id,
         name=request.name,
-        embedding=float(np.linalg.norm(embedding)),
-        embedding_vector=embedding_str,
+        embedding_vector=embedding_bytes,
         image_path=str(dest)
     )
     db.add(member)
@@ -458,8 +480,7 @@ def update_library_member(
             file_path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
         
-        member.embedding = float(np.linalg.norm(embedding))
-        member.embedding_vector = json.dumps(embedding.tolist())
+        member.embedding_vector = embedding.astype(np.float32).tobytes()
         member.image_path = str(file_path)
     
     db.commit()
@@ -546,33 +567,21 @@ def search_face(
     if file:
         file_bytes = file.file.read()
         validate_upload(file.filename or "image.jpg", len(file_bytes), file_bytes)
-        file_ext = _get_file_ext(file.filename or "image.jpg") or 'jpg'
-        filename = f"{uuid.uuid4()}.{file_ext}"
-        file_path = UPLOAD_DIR / filename
-        
-        with open(file_path, "wb") as f:
-            f.write(file_bytes)
-        
+        # No temp file needed - process directly from bytes
         try:
-            query_embedding, face_info = face_service.extract_embedding(str(file_path))
+            query_embedding, face_info = face_service.extract_embedding(file_bytes)
         except Exception as e:
-            file_path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
-        
-        file_path.unlink(missing_ok=True)
     elif image:
         try:
-            file_path = decode_base64_image(image)
+            image_bytes = decode_base64_image(image)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
         
         try:
-            query_embedding, face_info = face_service.extract_embedding(str(file_path))
+            query_embedding, face_info = face_service.extract_embedding(image_bytes)
         except Exception as e:
-            file_path.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
-        
-        file_path.unlink(missing_ok=True)
     else:
         raise HTTPException(status_code=400, detail="file or image is required")
     
@@ -580,7 +589,7 @@ def search_face(
     
     member_ids = [m.id for m in members]
     names = [m.name for m in members]
-    embeddings_matrix = np.array([json.loads(m.embedding_vector) for m in members])
+    embeddings_matrix = np.frombuffer(b"".join(m.embedding_vector for m in members), dtype=np.float32).reshape(-1, 512)
     
     results = face_service.search_faces(query_embedding, embeddings_matrix, member_ids, names, top_k, threshold)
     
@@ -606,23 +615,20 @@ def search_face_json(
         raise HTTPException(status_code=400, detail="image or file is required")
     
     try:
-        file_path = decode_base64_image(base64_image)
+        image_bytes = decode_base64_image(base64_image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
     
     try:
-        query_embedding, face_info = face_service.extract_embedding(str(file_path))
+        query_embedding, face_info = face_service.extract_embedding(image_bytes)
     except Exception as e:
-        file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
-    
-    file_path.unlink(missing_ok=True)
     
     members = db.query(FaceMember).filter(FaceMember.library_id == request.library_id).all()
     
     member_ids = [m.id for m in members]
     names = [m.name for m in members]
-    embeddings_matrix = np.array([json.loads(m.embedding_vector) for m in members])
+    embeddings_matrix = np.frombuffer(b"".join(m.embedding_vector for m in members), dtype=np.float32).reshape(-1, 512)
     
     results = face_service.search_faces(query_embedding, embeddings_matrix, member_ids, names, request.top_k, request.threshold)
     
@@ -636,17 +642,11 @@ def search_face_json(
 def detect_face(file: UploadFile = File(...)):
     file_bytes = file.file.read()
     validate_upload(file.filename or "image.jpg", len(file_bytes), file_bytes)
-    file_ext = _get_file_ext(file.filename or "image.jpg") or 'jpg'
-    filename = f"{uuid.uuid4()}.{file_ext}"
-    file_path = UPLOAD_DIR / filename
-    
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
     
     try:
-        faces = face_service.detect_faces(str(file_path))
-    finally:
-        file_path.unlink(missing_ok=True)
+        faces = face_service.detect_faces(file_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
     
     return {"faces": faces, "count": len(faces)}
 
@@ -655,17 +655,11 @@ def detect_face(file: UploadFile = File(...)):
 def detect_face_with_confidence(file: UploadFile = File(...)):
     file_bytes = file.file.read()
     validate_upload(file.filename or "image.jpg", len(file_bytes), file_bytes)
-    file_ext = _get_file_ext(file.filename or "image.jpg") or 'jpg'
-    filename = f"{uuid.uuid4()}.{file_ext}"
-    file_path = UPLOAD_DIR / filename
-    
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
     
     try:
-        faces = face_service.detect_faces_with_confidence(str(file_path))
-    finally:
-        file_path.unlink(missing_ok=True)
+        faces = face_service.detect_faces_with_confidence(file_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
     
     return {"faces": faces, "count": len(faces)}
 
@@ -681,24 +675,28 @@ def add_member_by_base64(
         raise HTTPException(status_code=404, detail="Library not found")
     
     try:
-        file_path = decode_base64_image(request.image)
+        image_bytes = decode_base64_image(request.image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
     
     try:
-        embedding, face_info = face_service.extract_embedding(str(file_path))
+        embedding, face_info = face_service.extract_embedding(image_bytes)
     except Exception as e:
-        file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
     
-    embedding_str = json.dumps(embedding.tolist())
+    # Save image to disk for reference (still needed for member records)
+    filename = f"{uuid.uuid4()}.jpg"
+    file_path = UPLOAD_DIR / filename
+    with open(file_path, "wb") as f:
+        f.write(image_bytes)
+    
+    embedding_bytes = embedding.astype(np.float32).tobytes()
     
     member = FaceMember(
         record_id=str(uuid.uuid4()),
         library_id=library_id,
         name=request.name,
-        embedding=float(np.linalg.norm(embedding)),
-        embedding_vector=embedding_str,
+        embedding_vector=embedding_bytes,
         image_path=str(file_path)
     )
     db.add(member)
@@ -731,23 +729,20 @@ def search_face_by_base64(
         raise HTTPException(status_code=404, detail="Library not found")
     
     try:
-        file_path = decode_base64_image(request.image)
+        image_bytes = decode_base64_image(request.image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
     
     try:
-        query_embedding, face_info = face_service.extract_embedding(str(file_path))
+        query_embedding, face_info = face_service.extract_embedding(image_bytes)
     except Exception as e:
-        file_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail=f"Face extraction failed: {str(e)}")
-    
-    file_path.unlink(missing_ok=True)
     
     members = db.query(FaceMember).filter(FaceMember.library_id == library_id).all()
     
     member_ids = [m.id for m in members]
     names = [m.name for m in members]
-    embeddings_matrix = np.array([json.loads(m.embedding_vector) for m in members])
+    embeddings_matrix = np.frombuffer(b"".join(m.embedding_vector for m in members), dtype=np.float32).reshape(-1, 512)
     
     results = face_service.search_faces(query_embedding, embeddings_matrix, member_ids, names, request.top_k, request.threshold)
     
@@ -760,14 +755,14 @@ def search_face_by_base64(
 @app.post("/api/detect/base64")
 def detect_face_by_base64(request: Base64DetectRequest):
     try:
-        file_path = decode_base64_image(request.image)
+        image_bytes = decode_base64_image(request.image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
     
     try:
-        faces = face_service.detect_faces(str(file_path))
-    finally:
-        file_path.unlink(missing_ok=True)
+        faces = face_service.detect_faces(image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Face detection failed: {str(e)}")
     
     return {"faces": faces, "count": len(faces)}
 
@@ -775,14 +770,14 @@ def detect_face_by_base64(request: Base64DetectRequest):
 @app.post("/api/detect/confidence/base64")
 def detect_face_confidence_by_base64(request: Base64DetectRequest):
     try:
-        file_path = decode_base64_image(request.image)
+        image_bytes = decode_base64_image(request.image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
     
     try:
-        faces = face_service.detect_faces_with_confidence(str(file_path))
-    finally:
-        file_path.unlink(missing_ok=True)
+        faces = face_service.detect_faces_with_confidence(image_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Face detection failed: {str(e)}")
     
     return {"faces": faces, "count": len(faces)}
 
@@ -792,26 +787,18 @@ def compare_faces(
     image1: UploadFile = File(...),
     image2: UploadFile = File(...),
 ):
-    paths = []
     try:
-        for img in [image1, image2]:
-            file_bytes = img.file.read()
-            validate_upload(img.filename or "image.jpg", len(file_bytes), file_bytes)
-            file_ext = _get_file_ext(img.filename or "image.jpg") or 'jpg'
-            path = UPLOAD_DIR / f"{uuid.uuid4()}.{file_ext}"
-            with open(path, "wb") as f:
-                f.write(file_bytes)
-            paths.append(path)
+        bytes1 = image1.file.read()
+        bytes2 = image2.file.read()
+        validate_upload(image1.filename or "image.jpg", len(bytes1), bytes1)
+        validate_upload(image2.filename or "image.jpg", len(bytes2), bytes2)
 
-        result = face_service.compare_faces(str(paths[0]), str(paths[1]))
+        result = face_service.compare_faces(bytes1, bytes2)
         return result
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        for p in paths:
-            p.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

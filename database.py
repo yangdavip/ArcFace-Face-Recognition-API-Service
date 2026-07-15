@@ -1,7 +1,7 @@
 import os
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, Index
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, LargeBinary
 from sqlalchemy.sql import func
 from pydantic import BaseModel
 from typing import Optional, List, Any
@@ -38,13 +38,15 @@ class FaceLibrary(Base):
 
 class FaceMember(Base):
     __tablename__ = "face_members"
+    __table_args__ = (
+        Index('ix_member_library_created', 'library_id', 'created_at'),
+    )
     
     id = Column(Integer, primary_key=True, index=True)
     record_id = Column(String(36), unique=True, nullable=False, index=True)
     library_id = Column(Integer, ForeignKey("face_libraries.id"), nullable=False, index=True)
     name = Column(String(100), nullable=False)
-    embedding = Column(Float, nullable=False)
-    embedding_vector = Column(Text, nullable=False)
+    embedding_vector = Column(LargeBinary, nullable=False)
     image_path = Column(String(500), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -72,8 +74,7 @@ class FaceMemberSchema(BaseModel):
 
 
 class FaceMemberWithEmbedding(FaceMemberSchema):
-    embedding: float
-    embedding_vector: str
+    embedding_vector: bytes
 
 
 class PaginatedResponse(BaseModel):
